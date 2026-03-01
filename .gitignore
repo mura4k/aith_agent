@@ -1,0 +1,55 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Virtualenv ----
+.venv/
+venv/
+ENV/
+env/
+
+# ---- IDE ----
+.vscode/
+.idea/
+*.iml
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+
+# ---- dotenv / secrets ----
+.env
+.env.*
+!.env.example
+
+# ---- Google service account keys ----
+*service_account*.json
+*service-account*.json
+*sa-key*.json
+*.gcp.json
+*.credentials.json
+
+# ---- Logs & runtime ----
+*.log
+logs/
+*.sqlite3
+*.db
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+
+# ---- Docker ----
+**/.dockerignore
+
+# ---- Google Sheets API ----
+credentials.json
