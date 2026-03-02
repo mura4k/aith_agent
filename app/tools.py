@@ -1,33 +1,22 @@
 from __future__ import annotations
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from app.sheets_client import SheetsClient, extract_sheet_id
 from app.content_fetch import fetch_description
 from app.domain import ToolResult
 
+
 def tool_schemas() -> List[Dict[str, Any]]:
     """
     OpenAI-style tool schema.
+    NOTE: We intentionally REMOVED extract_sheet_link tool.
+    Sheet URL extraction is deterministic and done in main.py via regex.
     """
     return [
         {
             "type": "function",
             "function": {
-                "name": "extract_sheet_link",
-                "description": "Extract a Google Sheets URL from user text. Returns url if found.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "text": {"type": "string"},
-                    },
-                    "required": ["text"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
                 "name": "confirm_sheet_link",
-                "description": "Store confirmed sheet URL in session state.",
+                "description": "Validate and store confirmed sheet URL in session state.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -130,13 +119,23 @@ def tool_schemas() -> List[Dict[str, Any]]:
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_calendar_links",
+                "description": "Get Google Calendar links for selected courses from worksheet 'Расписание' (C=course, S=calendar).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "sheet_url": {"type": "string"},
+                        "course_names": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["sheet_url", "course_names"],
+                },
+            },
+        },
     ]
 
-def extract_sheet_link_from_text(text: str) -> Optional[str]:
-    # simple: look for docs.google.com/spreadsheets
-    import re
-    m = re.search(r"https?://docs\.google\.com/spreadsheets/[^\s)]+", text)
-    return m.group(0) if m else None
 
 class ToolExecutor:
     def __init__(self, sheets: SheetsClient):
@@ -144,12 +143,7 @@ class ToolExecutor:
 
     async def run(self, name: str, args: Dict[str, Any], session_state: Dict[str, Any]) -> ToolResult:
         try:
-            if name == "extract_sheet_link":
-                url = extract_sheet_link_from_text(args["text"])
-                return ToolResult(ok=True, data={"sheet_url": url})
-
             if name == "confirm_sheet_link":
-                # state update happens outside (in orchestrator), this tool just validates
                 sheet_url = args["sheet_url"]
                 if not extract_sheet_id(sheet_url):
                     return ToolResult(ok=False, error="Not a valid Google Sheets URL.")
@@ -178,26 +172,32 @@ class ToolExecutor:
                 remaining = mx - (req + sel)
                 ok = remaining >= 0
                 msg = "Ок по лимиту." if ok else "Превышен лимит зачётных единиц."
-                return ToolResult(ok=True, data={
-                    "required_credits": req,
-                    "selected_credits": sel,
-                    "max_credits": mx,
-                    "remaining_credits": remaining,
-                    "ok": ok,
-                    "message": msg,
-                })
+                return ToolResult(
+                    ok=True,
+                    data={
+                        "required_credits": req,
+                        "selected_credits": sel,
+                        "max_credits": mx,
+                        "remaining_credits": remaining,
+                        "ok": ok,
+                        "message": msg,
+                    },
+                )
 
             if name == "prepare_write_preview":
                 sheet_url = args["sheet_url"]
                 student = args["student_display_name"]
                 selected = args["selected_courses"]
                 summary = f"Будет записано для {student}: " + ", ".join(selected)
-                return ToolResult(ok=True, data={
-                    "sheet_url": sheet_url,
-                    "student_display_name": student,
-                    "selected_courses": selected,
-                    "action_summary": summary,
-                })
+                return ToolResult(
+                    ok=True,
+                    data={
+                        "sheet_url": sheet_url,
+                        "student_display_name": student,
+                        "selected_courses": selected,
+                        "action_summary": summary,
+                    },
+                )
 
             if name == "write_selection":
                 if not args.get("user_confirmed"):
@@ -207,6 +207,12 @@ class ToolExecutor:
                 selected = args["selected_courses"]
                 res = self.sheets.write_selection(sheet_url, row, selected)
                 return ToolResult(ok=True, data=res)
+
+            if name == "get_calendar_links":
+                sheet_url = args["sheet_url"]
+                course_names = args["course_names"]
+                res = self.sheets.get_calendar_links_for_courses(sheet_url, course_names)
+                return ToolResult(ok=True, data={"calendar_links": res})
 
             return ToolResult(ok=False, error=f"Unknown tool: {name}")
 
