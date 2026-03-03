@@ -1,17 +1,24 @@
+# app/main.py
 from __future__ import annotations
+
 import asyncio
-import json
-import re
+import json, re
 from typing import Any, Dict, List, Optional
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message
 from aiogram.filters import Command
+from aiogram.types import Message
 from redis import Redis
 
 from app.config import get_settings
 from app.memory import RedisMemory
-from app.llm_openrouter import OpenRouterLLM, extract_assistant_message, has_tool_calls, tool_calls, tool_message
+from app.llm_gigachat import (
+    GigaChatLLM,
+    extract_assistant_message,
+    has_tool_calls,
+    tool_calls,
+    tool_message,
+)
 from app.sheets_client import SheetsClient
 from app.tools import tool_schemas, ToolExecutor
 
@@ -42,12 +49,15 @@ SYSTEM_PROMPT = """Ты — университетский Telegram-агент �
 
 SHEET_URL_RE = re.compile(r"https?://docs\.google\.com/spreadsheets/[^\s)]+", re.IGNORECASE)
 
+
 def user_key_from_message(msg: Message) -> str:
     return f"tg:{msg.from_user.id}"
+
 
 def greeting(msg: Message) -> str:
     uname = msg.from_user.full_name or msg.from_user.username or "студент"
     return f"Привет, {uname}!"
+
 
 def normalize_yes_no(text: str) -> str:
     t = (text or "").strip().lower()
@@ -57,12 +67,13 @@ def normalize_yes_no(text: str) -> str:
         return "no"
     return "unknown"
 
+
 def extract_sheet_url(text: str) -> Optional[str]:
     m = SHEET_URL_RE.search(text or "")
     return m.group(0) if m else None
 
-# -------- robust tool-args parsing (extract first JSON object + repairs) --------
 
+# -------- robust tool-args parsing (extract first JSON object + repairs) --------
 def _extract_first_json_object(s: str) -> Optional[str]:
     s = s.strip()
     start = s.find("{")
@@ -92,8 +103,9 @@ def _extract_first_json_object(s: str) -> Optional[str]:
             elif ch == "}":
                 depth -= 1
                 if depth == 0:
-                    return s[start:i+1]
+                    return s[start : i + 1]
     return None
+
 
 def safe_parse_tool_args(raw: str) -> Dict[str, Any]:
     if not raw:
@@ -114,6 +126,7 @@ def safe_parse_tool_args(raw: str) -> Dict[str, Any]:
     s = s.replace("“", '"').replace("”", '"').replace("’", "'")
     s = re.sub(r",\s*([}\]])", r"\1", s)
     s = re.sub(r"([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:\s*)", r'\1"\2"\3', s)
+    # fix accidental double quote before http(s): ""https:// -> "https://
     s = re.sub(r'""(https?://)', r'"\1', s)
 
     if "'" in s and '"' not in s:
@@ -132,10 +145,10 @@ def safe_parse_tool_args(raw: str) -> Dict[str, Any]:
         print("repaired:", s)
         return {}
 
-# ---------------- agent loop ----------------
 
+# ---------------- agent loop ----------------
 async def run_agent_turn(
-    llm: OpenRouterLLM,
+    llm: GigaChatLLM,
     tools: ToolExecutor,
     memory: RedisMemory,
     user_key: str,
@@ -146,24 +159,34 @@ async def run_agent_turn(
 
     if not history:
         history = [{"role": "system", "content": SYSTEM_PROMPT}]
-        history.append({"role": "assistant", "content": "Чтобы начать, пришлите/перешлите сообщение со ссылкой на таблицу выборности (Google Sheets)."})
+        history.append(
+            {
+                "role": "assistant",
+                "content": "Чтобы начать, пришлите/перешлите сообщение со ссылкой на таблицу выборности (Google Sheets).",
+            }
+        )
         memory.set_history(user_key, history)
 
+    # Append the user's message
     history.append({"role": "user", "content": user_text})
 
-    # Put compact session state for the model.
-    # (Do NOT dump huge JSON, keep it small.)
+    # Keep the state small: session hints only
     state_block = json.dumps(state, ensure_ascii=False)
     history.append({"role": "system", "content": f"SESSION_STATE_JSON: {state_block}"})
+
+    # Ensure system message is at the top of the history (if not already)
+    if history[0]["role"] != "system":
+        history = [{"role": "system", "content": SYSTEM_PROMPT}] + history
 
     tools_schema = tool_schemas()
 
     for _ in range(6):  # prevent infinite loops
+        print(history)
         resp = await llm.chat(history, tools=tools_schema)
         msg = extract_assistant_message(resp)
 
         if has_tool_calls(msg):
-            # IMPORTANT: validate tool args BEFORE appending this assistant message.
+            # Validate tool args BEFORE appending tool-calling assistant message.
             parsed_calls: List[tuple] = []
             bad = False
 
@@ -171,20 +194,24 @@ async def run_agent_turn(
                 fn = tc["function"]["name"]
                 raw_args = tc["function"].get("arguments", "")
                 args = safe_parse_tool_args(raw_args)
+
                 if not args:
                     bad = True
-                    history.append({
-                        "role": "system",
-                        "content": (
-                            f"Tool call '{fn}' had invalid JSON arguments. "
-                            "Retry the SAME tool call with STRICT valid JSON arguments only."
-                        ),
-                    })
+                    history.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                f"Tool call '{fn}' had invalid JSON arguments. "
+                                "Retry the SAME tool call with STRICT valid JSON arguments only."
+                            ),
+                        }
+                    )
                     break
+
                 parsed_calls.append((tc, fn, args))
 
             if bad:
-                # do NOT append broken msg with tool_calls; retry LLM
+                # Do NOT append broken assistant tool_calls; retry model.
                 continue
 
             # Now it's safe to append assistant message containing tool_calls
@@ -192,36 +219,48 @@ async def run_agent_turn(
 
             # Execute tools
             for tc, fn, args in parsed_calls:
-                tc_id = tc["id"]
+                tc_id = tc.get("id", "gc_tool_call_0")
                 result = await tools.run(fn, args, state)
                 result_dict = result.model_dump()
 
                 # deterministic state updates
                 if fn == "confirm_sheet_link" and result.ok and result.data.get("confirmed"):
-                    state = memory.update_state(user_key, {
-                        "sheet_url": result.data["sheet_url"],
-                        "sheet_confirmed": True,
-                        "candidate_sheet_url": None,
-                    })
+                    state = memory.update_state(
+                        user_key,
+                        {
+                            "sheet_url": result.data["sheet_url"],
+                            "sheet_confirmed": True,
+                            "candidate_sheet_url": None,
+                        },
+                    )
 
                 if fn == "verify_student" and result.ok and result.data.get("found"):
-                    state = memory.update_state(user_key, {
-                        "student_display_name": result.data.get("display_name"),
-                        "student_row_index": result.data.get("row_index"),
-                        "student_verified": True,
-                    })
+                    state = memory.update_state(
+                        user_key,
+                        {
+                            "student_display_name": result.data.get("display_name"),
+                            "student_row_index": result.data.get("row_index"),
+                            "student_verified": True,
+                        },
+                    )
 
                 if fn == "prepare_write_preview" and result.ok:
-                    state = memory.update_state(user_key, {
-                        "pending_write_preview": result.data,
-                        "awaiting_write_confirmation": True,
-                    })
+                    state = memory.update_state(
+                        user_key,
+                        {
+                            "pending_write_preview": result.data,
+                            "awaiting_write_confirmation": True,
+                        },
+                    )
 
                 if fn == "write_selection" and result.ok:
-                    state = memory.update_state(user_key, {
-                        "awaiting_write_confirmation": False,
-                        "pending_write_preview": None,
-                    })
+                    state = memory.update_state(
+                        user_key,
+                        {
+                            "awaiting_write_confirmation": False,
+                            "pending_write_preview": None,
+                        },
+                    )
 
                 history.append(tool_message(tc_id, fn, result_dict))
 
@@ -233,12 +272,17 @@ async def run_agent_turn(
         memory.set_state(user_key, state)
         return assistant_text
 
-    history.append({"role": "assistant", "content": "Я немного запутался. Пришлите ссылку на таблицу выборности ещё раз, пожалуйста."})
+    history.append(
+        {
+            "role": "assistant",
+            "content": "Я немного запутался. Пришлите ссылку на таблицу выборности ещё раз, пожалуйста.",
+        }
+    )
     memory.set_history(user_key, history)
     return "Я немного запутался. Пришлите ссылку на таблицу выборности ещё раз, пожалуйста."
 
-# ---------------- bot wiring ----------------
 
+# ---------------- bot wiring ----------------
 async def main():
     settings = get_settings()
 
@@ -251,10 +295,10 @@ async def main():
     sheets = SheetsClient(settings.google_sa_json)
     tool_exec = ToolExecutor(sheets)
 
-    llm = OpenRouterLLM(
-        api_key=settings.openrouter_api_key,
-        model=settings.openrouter_model,
-        app_title="UniAgentBot",
+    llm = GigaChatLLM(
+        api_key=settings.gigachat_api_key,
+        model=settings.gigachat_model,
+        base_url=settings.gigachat_base_url,
     )
 
     @dp.message(Command("start"))
@@ -279,7 +323,7 @@ async def main():
         if url:
             memory.update_state(uk, {"candidate_sheet_url": url})
 
-        # If awaiting write confirmation, put a small hint into state (optional)
+        # If awaiting write confirmation, store last yes/no (optional hint)
         state = memory.get_state(uk)
         if state.get("awaiting_write_confirmation"):
             yn = normalize_yes_no(user_text)
@@ -290,6 +334,7 @@ async def main():
         await m.answer(reply)
 
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
